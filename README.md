@@ -218,7 +218,7 @@ BizHawk declares SHA1 hashes for most files rather than MD5. Files with no decla
 
 **Canonical** — a unique BIOS file identity across all platforms. Two platforms calling the same bytes by different names equals one canonical. The tool deduplicates by content, not by name.
 
-**Blob** — one physical binary stored in the database. A canonical may have multiple blobs when different platforms accept different regional variants (e.g. a Japanese and a US version of the same BIOS). Each variant is a separate blob under the same canonical.
+**Blob** — one physical binary stored in the database. A canonical may have multiple blobs when different platforms accept different verified regional variants (e.g. a Japanese and a US version of the same BIOS, each with a distinct MD5). Only `verified` blobs coexist this way; `unverifiable` and `mismatch_accepted` blobs are limited to one per canonical.
 
 **Present** — at least one blob is stored for this canonical.
 
@@ -454,6 +454,8 @@ The shopping list row count shown at the end of Report will often differ from th
 ### Status is never downgraded
 
 A `verified` blob can never be displaced by a `mismatch_accepted` or `unverifiable` blob, regardless of scan order. When a better copy is found, the lower-status blob is deleted and replaced. When multiple verified variants of the same canonical exist, all are kept.
+
+For `unverifiable` and `mismatch_accepted` blobs, only one is kept per canonical at a time. If the same canonical is encountered again from a different source at the same status, the duplicate is silently discarded. A status upgrade — e.g. a subsequent scan finds an `unverifiable` copy for a canonical previously stored as `mismatch_accepted` — replaces the existing blob.
 
 ---
 
