@@ -276,7 +276,24 @@ def get_existing_status(conn: sqlite3.Connection, canonical: str) -> str | None:
         "  ELSE 4 END LIMIT 1",
         (canonical,),
     ).fetchone()
-    return row[0] if row else None
+    if row:
+        return row[0]
+
+    # Alias canonicals have no row in files — they point at another canonical's
+    # blob via canonical_aliases.  Fall through to the alias table so that
+    # _should_store's downgrade protection fires correctly for them too.
+    alias = conn.execute(
+        "SELECT f.status FROM canonical_aliases ca "
+        "JOIN files f ON f.sqlar_name = ca.sqlar_name "
+        "WHERE ca.canonical_name = ? "
+        "ORDER BY CASE f.status "
+        "  WHEN 'verified'          THEN 1 "
+        "  WHEN 'unverifiable'      THEN 2 "
+        "  WHEN 'mismatch_accepted' THEN 3 "
+        "  ELSE 4 END LIMIT 1",
+        (canonical,),
+    ).fetchone()
+    return alias[0] if alias else None
 
 
 def store_file(
@@ -670,12 +687,50 @@ class Scanner:
                     continue
                 member_name = info.filename.split("/")[-1]
                 data = zf.read(info.filename)
+
+                # Restore canonical alias mappings from a dump sidecar.  This
+                # file is written by bios_dump.py to preserve alias relationships
+                # that have no declared MD5 and cannot be re-established by
+                # filename or hash matching alone.
+                if info.filename == ".aliases.json":
+                    self._restore_aliases(data)
+                    continue
+
                 # Always try to match the member as a file (handles .zip BIOS like neogeo.zip)
                 self._process_bytes(member_name, data,
                                     source_label=f"{label}!{info.filename}", depth=depth)
                 # If it's also an archive, scan its contents too
                 if _is_archive(member_name):
                     self._scan_archive_bytes(member_name, data, depth + 1, label)
+
+    def _restore_aliases(self, data: bytes) -> None:
+        """Restore canonical_aliases entries from a dump sidecar (.aliases.json)."""
+        try:
+            entries = json.loads(data.decode("utf-8"))
+        except Exception as exc:
+            print(f"  WARNING: could not parse .aliases.json sidecar: {exc}")
+            return
+        restored = 0
+        for entry in entries:
+            canonical = entry.get("canonical_name", "")
+            sqlar_name = entry.get("sqlar_name", "")
+            if not canonical or not sqlar_name:
+                continue
+            # Only restore the alias if the target sqlar blob actually exists
+            exists = self.conn.execute(
+                "SELECT 1 FROM sqlar WHERE name = ?", (sqlar_name,)
+            ).fetchone()
+            if exists:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO canonical_aliases (canonical_name, sqlar_name) "
+                    "VALUES (?, ?)",
+                    (canonical, sqlar_name),
+                )
+                self.found.add(canonical)
+                restored += 1
+        if restored:
+            self.conn.commit()
+            print(f"  [aliases] Restored {restored} alias mapping(s) from dump sidecar.")
 
     def _scan_7z(self, path: str, depth: int, label: str) -> None:
         if not HAS_7Z:
@@ -1294,7 +1349,13 @@ def run(config: configparser.ConfigParser, base_dir: str = ".") -> bool:
     db_unverifiable = sum(1 for s in canonical_status.values() if s == "unverifiable")
     db_mismatch     = sum(1 for s in canonical_status.values() if s == "mismatch_accepted")
     db_present      = len(canonical_status)
-    db_total        = db_present + missing_count
+    # Alias canonicals live only in canonical_aliases — they have no files row and
+    # are excluded from missing_files by _canonical_in_db().  Count them separately
+    # so db_total matches the manifest.
+    alias_count = conn.execute(
+        "SELECT COUNT(DISTINCT canonical_name) FROM canonical_aliases"
+    ).fetchone()[0]
+    db_total        = db_present + missing_count + alias_count
 
     # Blob-level counts
     total_blobs    = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
@@ -1326,6 +1387,8 @@ def run(config: configparser.ConfigParser, base_dir: str = ".") -> bool:
     print(f"    verified          : {db_verified:>6}")
     print(f"    unverifiable      : {db_unverifiable:>6}")
     print(f"    hash mismatch     : {db_mismatch:>6}")
+    if alias_count:
+        print(f"    via alias         : {alias_count:>6}  (bytes stored under a different canonical name)")
     print(f"  Missing  : {missing_count:>6}  (not yet found in any source, across all platforms)")
     print(f"\n  Blobs stored : {total_blobs} total  "
           f"({verified_blobs} verified"
