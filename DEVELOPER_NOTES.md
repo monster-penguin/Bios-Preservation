@@ -56,7 +56,9 @@ CREATE TABLE missing_files (
 );
 ```
 
-Populated at the end of each build run for canonicals present in the manifest but absent from `files`. Cleared and repopulated on every build.
+Populated at the end of each build run for canonicals present in the manifest but absent from `files`. Cleared and repopulated on every build. Alias canonicals are excluded by `_canonical_in_db()` — they are not in `files` but their bytes are present, so they are not missing. As a consequence, alias canonicals appear in neither `files` nor `missing_files`, and `db_total = db_present + missing_count` would undercount them. `alias_count` (from `COUNT(DISTINCT canonical_name) FROM canonical_aliases`) is added to `db_total` and reported as a `via alias` line in the build summary.
+
+`_canonical_in_db()` returns `True` when a canonical's content is already present — either directly in `files` or via a matching hash — preventing it from being added to `missing_files`. Alias registration for canonicals not encountered during scanning is handled by `reconcile_aliases()`, which runs after `populate_missing_files` (see Note 17). Alias canonicals with no declared hashes (unverifiable) are covered by `bios_restore.py`'s `.aliases.json` sidecar handling on restore.
 
 ### `canonical_aliases` — alias resolution
 
@@ -89,7 +91,12 @@ Stores `generated_at` (ISO 8601 timestamp of the last manifest generation) and `
 
 **Blob** — a row in `files` + the corresponding row in `sqlar`. Keyed by `{md5}.{ext}`. Multiple blobs can exist for one canonical when platforms declare different accepted MD5s (regional variants). All are stored; staging picks the best match for each platform.
 
-**Alias canonical** — a canonical whose bytes are already stored under a different `canonical_name`. Recorded in `canonical_aliases`. This happens when two manifest entries (different names, same MD5) resolve to the same physical file. The report step uses `canonical_aliases` as a 4th fallback lookup.
+**Alias canonical** — a canonical whose physical bytes are already stored under a different `canonical_name`. Recorded in `canonical_aliases`. Two sub-cases:
+
+- **Hash-resolvable** — the canonical has declared hashes that match the stored blob. `reconcile_aliases()` finds and registers these in its post-scan pass (see Note 17).
+- **Unverifiable** — no declared hashes. Registered only when a `.aliases.json` sidecar is present in a scanned zip, or when `_store()` detects the same-MD5 collision during an original source scan.
+
+The report step uses `canonical_aliases` as a 4th fallback lookup.
 
 ### `_get_file_rows()` lookup chain (bios_report.py)
 
@@ -280,6 +287,10 @@ Asset data directories (Dolphin/PPSSPP/blueMSX game data packs) are defined in `
 
 Status rank: `verified (1) > unverifiable (2) > mismatch_accepted (3)`. A lower rank number is better. Status only ever moves to a lower number. A `mismatch_accepted` blob is deleted when any `verified` blob for the same canonical is stored.
 
+This protection applies equally to alias canonicals. `get_existing_status()` falls through to `canonical_aliases` when `files` has no row for the canonical, so a canonical that is effectively verified via an alias is treated as verified for downgrade-protection purposes.
+
+**Alias registration also triggers stale-blob cleanup.** When `_store()` detects that an incoming blob already exists in `sqlar` under a different `canonical_name` (the same-MD5 alias case), it registers the alias in `canonical_aliases` and then checks whether the incoming canonical still has any direct `files` entries with lower status than the alias target's status. If so, those stale blobs are removed via `remove_sqlar_entry()`. This covers the scan-order scenario where canonicals sharing an expected MD5 (e.g. `syscard3.pce` and `syscard3u.pce`) were scanned in a previous session, leaving a `mismatch_accepted` blob for the secondary canonical even after the correct version was stored for the primary. Without this cleanup, the collection summary would continue counting those canonicals as `hash_mismatch` even though their bytes are present and verified via the alias.
+
 ### 6. Multi-variant coexistence
 
 Two `verified` blobs for the same canonical (different MD5s) coexist without one superseding the other. `_cleanup_superseded()` only removes `mismatch_accepted` blobs when a `verified` copy exists — it never removes a `verified` blob to make room for another `verified` blob.
@@ -294,7 +305,7 @@ Non-verified blobs (`unverifiable`, `mismatch_accepted`) are limited to one per 
 
 Three conditions must all pass for a blob to be stored:
 1. This exact MD5 is not already stored **for this canonical** with the same status. The check is scoped to `canonical_name` — if the same MD5 is already stored under a *different* canonical, condition 1 passes so that `_store()` can run and register the alias in `canonical_aliases`. An unscoped check would silently block alias registration for any file whose bytes are already present under another name.
-2. The incoming status is not lower than the best existing status for this canonical (no downgrading a verified canonical with unverifiable/mismatch data)
+2. The incoming status is not lower than the best existing status for this canonical (no downgrading a verified canonical with unverifiable/mismatch data). "Existing status" is determined by `get_existing_status()`, which checks `files` first and falls back to `canonical_aliases` — so alias canonicals are protected even though they have no direct row in `files`.
 3. For non-verified blobs: no blob of equal or better non-verified status already exists for this canonical. Only `verified` blobs may coexist (regional variants with distinct MD5s). A strict status upgrade (e.g. `mismatch_accepted` → `unverifiable`) is allowed; a same-status or lower-status duplicate is rejected. This prevents duplicate `unverifiable` or `mismatch_accepted` blobs from accumulating across multiple source scans, which would cause sqlar bloat and path collisions during the dump stage.
 
 ### 9. Source management and persistence
@@ -305,9 +316,17 @@ Source paths are managed interactively at the start of each Build run and persis
 
 The build step reads `generated_at` from the `meta` table and compares it to the timestamp in the incoming manifest. If they differ, the manifest has been regenerated and `_purge_orphans()` is run before scanning — removing blobs whose `canonical_name` is no longer present in the current manifest.
 
-### 11. Backup and dump naming
+### 11. Backup naming
 
-Backup files: `DD_mon_YYYY_backup.sqlar`. Dump files: `DD_mon_YYYY_dump.zip`. Both are cross-platform safe. If a file with today's date already exists, a counter suffix is appended (`(2)`, `(3)`, …). No existing file is ever overwritten.
+Backup files: `DD_mon_YYYY_backup.zip`. Cross-platform safe. If a file with today's date already exists, a counter suffix is appended (`(2)`, `(3)`, …). No existing file is ever overwritten.
+
+### 11a. Backup sidecars (`.blob_map.json` and `.aliases.json`)
+
+The backup zip contains two sidecars written by `bios_backup.py`:
+
+**`.blob_map.json`** — maps every `sqlar_name → {canonical_name, status}` for all blobs in the `files` table. `bios_restore.py` uses this to identify each blob by its canonical name directly, without relying on the current manifest. This makes restoration robust when the manifest has changed since the backup was made — verified blobs are named `{md5}.{ext}` in the backup and could not otherwise be matched back to a canonical if their MD5 is no longer declared in the manifest.
+
+**`.aliases.json`** — records every `(canonical_name, sqlar_name)` pair from `canonical_aliases`. Alias canonicals have no row in `files` and no blob of their own — they would otherwise be lost entirely during restore. `bios_restore.py` re-inserts each alias pair, but only if the target blob was actually re-ingested (exists in `sqlar`). This guard prevents alias entries from a backup of database A being injected into an unrelated database B.
 
 ### 12. 7z extraction and temp directory
 
@@ -321,7 +340,15 @@ The cache directory is named `yaml_cache/` rather than `yaml/`. Python treats an
 
 When `_store()` finds that the incoming blob's MD5 already exists in `sqlar` under a different `canonical_name`, it records the new name in `canonical_aliases` (rather than overwriting the existing entry). For this to happen, `_should_store()` must first return `True` — which is why its MD5 duplicate check (condition 1) is scoped to the same `canonical_name`. Without that scope, a file matched by filename to canonical B whose bytes are already stored under canonical A would be silently dropped by `_should_store()`, and the alias would never be recorded. `_get_file_rows()` in `bios_report.py` uses `canonical_aliases` as its 4th fallback lookup, after direct canonical name, hash-based, and `database_filename` lookups all fail. `write_build_manifest()` also joins against `canonical_aliases` to fill `database_filename` for alias canonicals.
 
-The `canonical_aliases` table is populated only during active scanning. On a fresh database it will be empty until the first build run. A full rebuild (`incremental = false`) guarantees complete population.
+The `canonical_aliases` table is populated in three ways:
+
+1. **`_store()` during scanning** — when an incoming blob’s MD5 matches an existing `sqlar` entry under a different canonical, the new name is inserted as an alias. After registering the alias, `_store()` also removes any stale lower-status direct blobs the incoming canonical had in `files` (see Note 5 for detail on this cleanup).
+2. **`reconcile_aliases()` post-scan pass** — runs after `populate_missing_files` on every build. Handles canonicals whose bytes were never directly encountered during scanning but whose declared MD5 is already stored under a different canonical, and cleans up stale `mismatch_accepted` and `unverifiable` blobs superseded by a verified alias. See Note 17 for full detail.
+3. **`bios_restore.py` via `.aliases.json` sidecar** — re-inserts alias pairs recorded by `bios_backup.py`, but only for pairs whose target blob was actually re-ingested. Handles unverifiable alias canonicals that have no declared hashes and cannot be found by any hash lookup.
+
+On a fresh database built from original sources, the table is populated by paths 1 and 2. A full rebuild (`incremental = false`) guarantees complete population. When building from a backup zip, path 3 handles the cases paths 1 and 2 cannot reach.
+
+`get_existing_status()` checks `files` first, then falls back to `canonical_aliases` (joining against `files` on `sqlar_name` to retrieve the target blob's status). This ensures that `_should_store()`'s downgrade protection fires correctly for alias canonicals — without this fallback, any alias canonical would appear to have no existing status, allowing wrong-version files to be stored as `mismatch_accepted` for canonicals that are already effectively verified via an alias.
 
 ### 15. Shopping list status determination
 
@@ -339,3 +366,69 @@ A final sanity pass before CSV write corrects any `unverifiable + known expected
 ### 16. Report row expansion for multi-variant mismatches
 
 When a file is present but has multiple declared MD5 variants and none match what is stored, the per-platform report emits one row per declared MD5. This makes each acceptable regional version a distinct, searchable row. The `# STAGING PATHS` header comment notes that actual CSV row count may exceed unique staging path count for this reason.
+
+### 17. `reconcile_aliases()` — post-scan alias reconciliation pass
+
+Runs on every build immediately after `populate_missing_files` and before the
+collection statistics block, so all counts in the build summary reflect the
+fully reconciled state.
+
+Three cases are handled, all MD5-based:
+
+**Case 1 — never ingested, declared MD5 already stored elsewhere.**
+For each canonical that has no row in `files` and no entry in
+`canonical_aliases`, the pass checks whether any declared MD5 for that
+canonical is stored in `files` under a different `canonical_name`. If found,
+a row is inserted into `canonical_aliases` and any `missing_files` rows for
+that canonical are deleted. No blob is written or removed.
+
+**Case 2 — `mismatch_accepted` blob superseded by a verified alias.**
+For each `mismatch_accepted` blob in `files`, the pass checks whether any
+declared MD5 for that canonical is stored as `verified` under a different
+`canonical_name`. If found, the stale mismatch blob is removed via
+`remove_sqlar_entry()` (which also cleans `canonical_aliases`, `file_platforms`,
+and `accepted_hashes`), and the canonical is registered as an alias of the
+verified primary.
+
+**Case 3 — `unverifiable` blob superseded by a verified alias.**
+For each `unverifiable` blob in `files`, the pass checks whether the blob's
+actual stored MD5 matches a `verified` blob under a different `canonical_name`.
+This handles the common case where `find_in_manifest()` matched a file by
+filename to an unverifiable canonical before the hash-based lookup could match
+it to the correct verified canonical. If found, the stale unverifiable blob is
+removed and the canonical is registered as an alias.
+
+All three cases print a verbose line per resolution and emit a summary count
+(`N alias(es) registered, N stale blob(s) removed`) at the end. If nothing
+requires resolution the pass reports cleanly with zero counts.
+
+Note: the unverifiable case (Case 3) uses the blob's actual stored MD5, not
+any declared MD5, because unverifiable canonicals have no declared hashes by
+definition. A future improvement (see ROADMAP item 1) will add stronger
+signals — size matching, CRC32, cross-platform corroboration — for cases
+where even the actual stored MD5 cannot be matched.
+
+### 18. `remove_sqlar_entry()` — complete blob removal
+
+`remove_sqlar_entry()` deletes a blob and all associated metadata in a single
+call. It removes rows from five tables:
+
+```
+sqlar             WHERE name       = sqlar_name
+files             WHERE sqlar_name = sqlar_name
+file_platforms    WHERE sqlar_name = sqlar_name
+accepted_hashes   WHERE sqlar_name = sqlar_name
+canonical_aliases WHERE sqlar_name = sqlar_name
+```
+
+The `canonical_aliases` deletion is critical. Without it, any alias entry
+pointing at a deleted blob becomes a dangling pointer — a `canonical_name`
+recorded as resolved but with no backing blob in `sqlar`. These dangling
+entries are invisible during a build run (they satisfy `_canonical_in_db()`'s
+alias check, so the canonical is not flagged as missing) but fail silently
+during restore: `bios_restore.py` skips alias entries whose target `sqlar_name`
+does not exist, so the canonical ends up unresolved after restore.
+
+Every caller that deletes a blob — `_cleanup_superseded()`, the
+reconciliation pass Cases 2 and 3, and `audit_sqlar()` — goes through
+`remove_sqlar_entry()`, so no partial deletion path exists.
