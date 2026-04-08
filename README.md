@@ -157,7 +157,7 @@ Presents a numbered menu. After each step completes, the menu returns. Enter `0`
   3. Stage
   4. Report
   5. Backup
-  6. Dump
+  6. Restore
   7. Configure
   0. Exit
 ────────────────────────────────────────────────────────────
@@ -294,14 +294,22 @@ Sources may be local directories, local archive files (zip, 7z, rar, tar, tar.gz
     verified          :   1740
     unverifiable      :    141
     hash mismatch     :    231
-  Missing  :     86  (not yet found in any source, across all platforms)
+  Via alias:     54  (bytes stored under a different canonical name)
+  Missing  :      0  (not yet found in any source, across all platforms)
 
   Blobs stored : 2816 total  (2084 verified, 129 canonical(s) with multiple verified variants)
 
-  Shopping list: roughly 458 rows expected (86 missing + 231 mismatch + 141 unverifiable).
+  Shopping list: roughly 372 rows expected (0 missing + 231 mismatch + 141 unverifiable).
+  Actual row count varies:
+    mismatch    — expands when multiple MD5 variants are declared (one row per version).
+    missing     — may consolidate when multiple canonicals share an expected MD5.
+    unverifiable — may expand: alias canonicals whose primary blob is unverifiable
+                  each appear as their own row alongside the primary canonical.
 ```
 
-The `Missing` count is global — canonicals absent from the database across all platforms combined. Per-platform missing counts in the Report step will be smaller because each platform declares only a subset of all canonicals.
+The `Missing` count is global — canonicals absent from the database across all platforms combined. Per-platform counts in the Report step cover only the files that platform declares, so they will always be lower than the totals shown above.
+
+The `Via alias` line appears when canonicals are present whose bytes are stored under a different canonical name (see [Core Concepts](#core-concepts)). These are fully resolved and do not appear on the shopping list.
 
 **Outputs** (written to `build/`):
 - `bios_database.sqlar` — the database
@@ -398,15 +406,7 @@ Global shopping list → ...\global_shopping_list.csv  (2 missing, 278 hash_mism
 
 ### Step 5 — Backup
 
-Copies `bios_database.sqlar` into the `backup/` folder with today's date in the filename. No existing backup is ever overwritten — a counter suffix is appended if needed.
-
-**Output naming:** `backup/20_mar_2026_backup.sqlar`, `backup/20_mar_2026_backup(2).sqlar`, …
-
----
-
-### Step 6 — Dump
-
-Exports every blob stored in the database into a dated zip archive. Files are written into three status-named subfolders to support reliable re-ingestion on a new machine:
+Exports every blob stored in the database into a dated zip archive. Files are written into three status-named subfolders:
 
 | Subfolder | Contents | Naming |
 |-----------|----------|--------|
@@ -416,9 +416,33 @@ Exports every blob stored in the database into a dated zip archive. Files are wr
 
 Using full staging paths (rather than bare filenames) for `unverifiable/` and `mismatch_accepted/` prevents collisions between files that share a basename across different systems (e.g. `np2kai/bios.rom` vs `keropi/bios.rom`).
 
-A dump zip can be used as a Build source on a new machine to fully restore the database.
+The backup zip also contains two sidecars:
 
-**Output naming:** `dump/20_mar_2026_dump.zip`, `dump/20_mar_2026_dump(2).zip`, …
+- `.blob_map.json` — maps every blob's storage key to its canonical name and status. Used by Restore to identify blobs without relying on the current manifest, so restoration is robust across manifest updates.
+- `.aliases.json` — records every entry in the `canonical_aliases` table. Used by Restore to re-establish alias relationships for canonicals that have no declared MD5 of their own.
+
+Use the Restore step to load a backup zip into a fresh database.
+
+**Output naming:** `backup/20_mar_2026_backup.zip`, `backup/20_mar_2026_backup(2).zip`, …
+
+---
+
+### Step 6 — Restore
+
+Restores the database from a backup zip produced by the Backup step. Presents a numbered list of available backups in the `backup/` folder, or accepts a custom path.
+
+For each blob in the backup:
+
+- **Canonical still in current manifest** — stored normally into the database
+- **Canonical no longer in manifest** — written to `orphans/` as `{md5}.{ext}` alongside `_orphans.json`, which maps each file to its original canonical name
+
+Alias relationships are restored from `.aliases.json`. The Restore step always starts with a fresh database (existing database is deleted after confirmation).
+
+If orphans are produced, run Update then add the `orphans/` folder as a Build source. Files will be re-ingested if the updated manifest declares their MD5.
+
+**Output:** `build/bios_database.sqlar` — the restored database, ready to use.
+
+**Orphans (if any):** `orphans/` — blobs whose canonical is no longer in the manifest, plus `_orphans.json` index.
 
 ---
 
@@ -452,12 +476,15 @@ The build summary counts **canonicals across all platforms combined**. Each plat
 
 The blob count on the `Blobs stored:` line can exceed the canonical count. This happens when multiple verified regional variants of the same BIOS are stored (e.g. Japanese and US versions of the same file). Both count as one canonical but two blobs.
 
+The `via alias` line in the summary counts canonicals whose physical bytes are already stored under a different canonical name — they have no blob of their own but are fully resolved. They are included in the total so the summary canonical count matches the manifest.
+
 ### Shopping list row count
 
 The shopping list row count shown at the end of Report will often differ from the estimate printed by Build. This is expected:
 
-- **Mismatch files expand** — a canonical with 3 declared MD5 variants that all fail produces 3 rows (one per version to hunt for)
-- **Missing files may consolidate** — multiple canonicals sharing the same expected MD5 merge into one row
+- **Mismatch expands** — a canonical with 3 declared MD5 variants that all fail produces 3 rows (one per version to hunt for)
+- **Missing may consolidate** — multiple canonicals sharing the same expected MD5 merge into one row
+- **Unverifiable may expand** — alias canonicals whose primary blob is unverifiable each appear as their own row alongside the primary canonical, so the row count can exceed the unverifiable canonical count
 
 ### Status is never downgraded
 
@@ -540,9 +567,6 @@ bizhawk   = yes
 
 [backup]
 backup_dir = backup
-
-[dump]
-dump_dir = dump
 ```
 
 ---
@@ -560,16 +584,16 @@ bios_preservation/
 │   ├── bios_build.py                 ← Step 2: scan sources, build database
 │   ├── bios_stage.py                 ← Step 3: stage files per platform
 │   ├── bios_report.py                ← Step 4: generate per-platform reports
-│   ├── bios_backup.py                ← Step 5: backup the database
-│   ├── bios_dump.py                  ← Step 6: export all files to a zip
+│   ├── bios_backup.py                ← Step 5: export all blobs to a dated zip
+│   ├── bios_restore.py               ← Step 6: restore database from a backup zip
 │   └── bios_configure.py             ← Step 7: interactive configuration editor
 ├── yaml_cache/                       ← downloaded platform YAML files (auto-created)
 ├── update/                           ← manifest outputs (auto-created)
 ├── build/                            ← database and build manifests (auto-created)
 ├── stage/                            ← staged platform output (auto-created)
 ├── report/                           ← per-platform CSV reports (auto-created)
-├── backup/                           ← dated database backups (auto-created)
-├── dump/                             ← dated export zips (auto-created)
+├── backup/                           ← dated backup zips (auto-created)
+├── orphans/                          ← blobs orphaned during restore (auto-created if needed)
 └── temp/                             ← .7z extraction workspace (auto-created)
 ```
 
