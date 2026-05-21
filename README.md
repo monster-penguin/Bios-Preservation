@@ -11,7 +11,7 @@ A Python tool for collecting, verifying, organising, and staging retro gaming BI
 Full documentation is in the [project wiki](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki):
 
 - **[Home](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Home)** — overview and page index
-- **[Installation & Quick Start](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Installation)** — prerequisites, setup, and first run
+- **[Installation](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Installation)** — prerequisites, setup, and first run
 - **[How to Run](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/How-to-Run)** — interactive menu and command-line usage
 - **[Workflow](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Workflow)** — Update → Build → Report → Stage → Backup → Restore → Configure
 - **[Supported Platforms](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Supported-Platforms)** — full platform table and notes
