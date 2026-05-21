@@ -11,9 +11,9 @@ A Python tool for collecting, verifying, organising, and staging retro gaming BI
 Full documentation is in the [project wiki](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki):
 
 - **[Home](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Home)** — overview and page index
-- **[Installation](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Installation)** — prerequisites, setup, and first run
-- **[How to Run](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/How-to-Run)** — interactive menu and command-line usage
-- **[Workflow](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Workflow)** — Update → Build → Report → Stage → Backup → Restore → Configure
+- **[Installation](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/%23-Installation)** — prerequisites, setup, and first run
+- **[How to Run](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/%23-How-to-Run)** — interactive menu and command-line usage
+- **[Workflow](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/%23-Workflow)** — Update → Build → Report → Stage → Backup → Restore → Configure
 - **[Supported Platforms](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Supported-Platforms)** — full platform table and notes
 - **[Core Concepts](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Core-Concepts)** — canonical, blob, verified, unverifiable, hash mismatch
 - **[Understanding the Output](https://github.com/monster-penguin/BIOS-Preservation-Tool/wiki/Understanding-the-Output)** — build counts, report counts, shopping list
